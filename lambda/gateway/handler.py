@@ -155,7 +155,7 @@ def chat_completion(body, team_info):
     """Handle chat completion requests via Bedrock."""
 
     # Parse request
-    model_name = body.get('model', 'claude-3-haiku')
+    model_name = body.get('model', 'nova-micro')
     messages = body.get('messages', [])
     max_tokens = body.get('max_tokens', 1024)
     temperature = body.get('temperature', 0.7)
