@@ -2,7 +2,7 @@ import argparse
 import boto3
 import secrets
 import string
-from datetime import datetime
+from datetime import datetime, timezone
 
 def generate_api_key(prefix="llmgw"):
     chars = string.ascii_letters + string.digits
@@ -25,7 +25,7 @@ def main():
         "team_id": args.team_id,
         "name": args.name,
         "active": True,
-        "created_at": datetime.utcnow().isoformat(),
+        "created_at": datetime.now(timezone.utc).isoformat(),
         "rate_limit_per_min": args.rate_limit,
         "settings": {}
     })

@@ -1,7 +1,7 @@
 import json
 import os
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from auth import validate_api_key
 from router import route_request
 from usage import track_usage
@@ -11,7 +11,9 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 def lambda_handler(event, context):
-    logger.info(f"Event: {json.dumps(event)}")
+    # Log request path and method only (avoid logging sensitive headers/body)
+    http_context = event.get("requestContext", {}).get("http", {})
+    logger.info(f"Request: {http_context.get('method', 'UNKNOWN')} {http_context.get('path', '/')}")
     
     http_method = event.get("requestContext", {}).get("http", {}).get("method", "")
     path = event.get("requestContext", {}).get("http", {}).get("path", "")
@@ -19,7 +21,7 @@ def lambda_handler(event, context):
     body = event.get("body", "")
     
     if path == "/health":
-        return create_response(200, {"status": "healthy", "timestamp": datetime.utcnow().isoformat()})
+        return create_response(200, {"status": "healthy", "timestamp": datetime.now(timezone.utc).isoformat()})
     
     api_key = headers.get("x-api-key") or headers.get("X-Api-Key")
     if not api_key:
@@ -57,9 +59,9 @@ def lambda_handler(event, context):
             if not messages:
                 return create_response(400, {"error": "Missing: messages"})
             
-            start = datetime.utcnow()
+            start = datetime.now(timezone.utc)
             result = route_request(model, request_data, team_settings)
-            duration = (datetime.utcnow() - start).total_seconds() * 1000
+            duration = (datetime.now(timezone.utc) - start).total_seconds() * 1000
             
             if result["success"]:
                 track_usage(team_id, model, result.get("input_tokens", 0), result.get("output_tokens", 0), duration)

@@ -1,16 +1,17 @@
 import os
 import boto3
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import logging
+from botocore.exceptions import ClientError
 from router import get_model_cost
 
-logger = logging.getLogger()
+logger = logging.getLogger(__name__)
 dynamodb = boto3.resource("dynamodb")
 usage_table = dynamodb.Table(os.environ.get("USAGE_TABLE", "llm-gateway-usage-dev"))
 
 def track_usage(team_id, model, input_tokens, output_tokens, duration_ms):
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     costs = get_model_cost(model)
     cost = (input_tokens / 1000 * costs["input"]) + (output_tokens / 1000 * costs["output"])
     try:
@@ -26,11 +27,12 @@ def track_usage(team_id, model, input_tokens, output_tokens, duration_ms):
             "date": now.strftime("%Y-%m-%d"),
             "expires_at": int((now + timedelta(days=90)).timestamp())
         })
-    except Exception as e:
-        logger.error(f"Usage tracking error: {str(e)}")
+    except ClientError as e:
+        logger.warning(f"DynamoDB error tracking usage: {e.response['Error']['Code']}")
+        # Don't fail the request if usage tracking fails
 
 def get_usage_stats(team_id, days=30):
-    start_date = (datetime.utcnow() - timedelta(days=days)).isoformat()
+    start_date = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
     try:
         response = usage_table.query(
             KeyConditionExpression="team_id = :tid AND #ts >= :start",
@@ -49,6 +51,9 @@ def get_usage_stats(team_id, days=30):
             "total_output_tokens": total_output,
             "total_cost_usd": round(total_cost, 4)
         }
-    except Exception as e:
-        logger.error(f"Usage stats error: {str(e)}")
+    except ClientError as e:
+        logger.error(f"DynamoDB error getting usage stats: {e.response['Error']['Code']}")
+        return {"error": "Failed to get stats"}
+    except (KeyError, ValueError) as e:
+        logger.error(f"Invalid usage stats data format: {str(e)}")
         return {"error": "Failed to get stats"}

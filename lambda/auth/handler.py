@@ -7,7 +7,13 @@ import json
 import os
 import boto3
 import secrets
+import logging
 from datetime import datetime, timezone
+from botocore.exceptions import ClientError
+
+# Configure logging
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 dynamodb = boto3.resource('dynamodb')
 API_KEYS_TABLE = os.environ.get('API_KEYS_TABLE')
@@ -74,10 +80,11 @@ def create_api_key(body):
             })
         }
         
-    except Exception as e:
+    except ClientError as e:
+        logger.error(f"DynamoDB error creating API key: {e.response['Error']['Code']}")
         return {
             'statusCode': 500,
-            'body': json.dumps({'error': str(e)})
+            'body': json.dumps({'error': 'Failed to create API key'})
         }
 
 
@@ -109,8 +116,9 @@ def list_api_keys():
             })
         }
         
-    except Exception as e:
+    except ClientError as e:
+        logger.error(f"DynamoDB error listing API keys: {e.response['Error']['Code']}")
         return {
             'statusCode': 500,
-            'body': json.dumps({'error': str(e)})
+            'body': json.dumps({'error': 'Failed to list API keys'})
         }

@@ -6,8 +6,14 @@ Provides usage statistics and cost tracking for FinOps.
 import json
 import os
 import boto3
+import logging
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal
+from botocore.exceptions import ClientError
+
+# Configure logging
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 dynamodb = boto3.resource('dynamodb')
 USAGE_TABLE = os.environ.get('USAGE_TABLE')
@@ -70,8 +76,11 @@ def get_team_from_key(api_key):
         table = dynamodb.Table(API_KEYS_TABLE)
         response = table.get_item(Key={'api_key': api_key})
         return response.get('Item')
-    except Exception as e:
-        print(f"Error getting team: {str(e)}")
+    except ClientError as e:
+        logger.error(f"DynamoDB error getting team: {e.response['Error']['Code']}")
+        return None
+    except (KeyError, ValueError) as e:
+        logger.error(f"Invalid team data format: {str(e)}")
         return None
 
 
@@ -96,27 +105,29 @@ def get_usage(team_id, days):
         )
         
         items = response.get('Items', [])
-        
-        # Aggregate data
+
+        # Single-pass aggregation for better performance
         total_requests = 0
         total_input_tokens = 0
         total_output_tokens = 0
         total_cost = Decimal('0')
         model_usage = {}
         daily = []
-        
+
         for item in items:
+            # Extract values once per item
             requests = int(item.get('requests', 0))
             input_tokens = int(item.get('input_tokens', 0))
             output_tokens = int(item.get('output_tokens', 0))
             cost = item.get('total_cost', Decimal('0'))
-            
+
+            # Accumulate totals
             total_requests += requests
             total_input_tokens += input_tokens
             total_output_tokens += output_tokens
             total_cost += cost
-            
-            # Daily breakdown
+
+            # Build daily entry
             daily.append({
                 'date': item.get('date'),
                 'requests': requests,
@@ -124,12 +135,11 @@ def get_usage(team_id, days):
                 'output_tokens': output_tokens,
                 'cost_usd': float(cost)
             })
-            
-            # Model breakdown
-            models = item.get('models', {})
-            for model, count in models.items():
+
+            # Aggregate model usage in single pass
+            for model, count in item.get('models', {}).items():
                 model_usage[model] = model_usage.get(model, 0) + int(count)
-        
+
         # Sort daily by date
         daily.sort(key=lambda x: x['date'])
         
@@ -150,8 +160,23 @@ def get_usage(team_id, days):
             ]
         }
         
-    except Exception as e:
-        print(f"Error getting usage: {str(e)}")
+    except ClientError as e:
+        logger.error(f"DynamoDB error getting usage: {e.response['Error']['Code']}")
+        return {
+            'summary': {
+                'total_requests': 0,
+                'total_input_tokens': 0,
+                'total_output_tokens': 0,
+                'total_tokens': 0,
+                'total_cost_usd': 0,
+                'avg_daily_cost_usd': 0,
+                'avg_tokens_per_request': 0
+            },
+            'daily': [],
+            'by_model': []
+        }
+    except (KeyError, ValueError) as e:
+        logger.error(f"Invalid usage data format: {str(e)}")
         return {
             'summary': {
                 'total_requests': 0,

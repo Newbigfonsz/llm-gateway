@@ -7,10 +7,16 @@ import json
 import os
 import boto3
 import time
+import logging
 from datetime import datetime, timezone
 from decimal import Decimal
+from botocore.exceptions import ClientError
 
-# Initialize clients
+# Configure logging
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+
+# Initialize clients (reused across Lambda invocations)
 dynamodb = boto3.resource('dynamodb')
 bedrock = boto3.client('bedrock-runtime')
 
@@ -147,15 +153,30 @@ def list_models():
 
 def chat_completion(body, team_info):
     """Handle chat completion requests via Bedrock."""
-    
+
     # Parse request
     model_name = body.get('model', 'claude-3-haiku')
     messages = body.get('messages', [])
     max_tokens = body.get('max_tokens', 1024)
     temperature = body.get('temperature', 0.7)
-    
+
+    # Validate messages
     if not messages:
         return error_response(400, 'Messages array is required.')
+
+    if not isinstance(messages, list):
+        return error_response(400, 'Messages must be an array.')
+
+    # Validate each message structure
+    for i, msg in enumerate(messages):
+        if not isinstance(msg, dict):
+            return error_response(400, f'Message at index {i} must be an object.')
+        if 'role' not in msg:
+            return error_response(400, f'Message at index {i} missing required field: role')
+        if msg['role'] not in ('system', 'user', 'assistant'):
+            return error_response(400, f'Invalid role at index {i}: {msg["role"]}')
+        if 'content' not in msg:
+            return error_response(400, f'Message at index {i} missing required field: content')
     
     # Map model name to Bedrock model ID
     model_id = MODEL_MAPPING.get(model_name, model_name)
@@ -217,9 +238,16 @@ def chat_completion(body, team_info):
             })
         }
         
-    except Exception as e:
-        print(f"Error calling Bedrock: {str(e)}")
-        return error_response(500, f'Model invocation failed: {str(e)}')
+    except ClientError as e:
+        error_code = e.response.get('Error', {}).get('Code', 'Unknown')
+        logger.error(f"Bedrock API error: {error_code} - {str(e)}")
+        return error_response(500, f'Model invocation failed: {error_code}')
+    except (KeyError, IndexError) as e:
+        logger.error(f"Unexpected response format from Bedrock: {str(e)}")
+        return error_response(500, 'Unexpected response format from model')
+    except json.JSONDecodeError as e:
+        logger.error(f"Failed to decode Bedrock response: {str(e)}")
+        return error_response(500, 'Invalid response from model')
 
 
 def call_anthropic_model(model_id, messages, max_tokens, temperature):
@@ -350,14 +378,25 @@ def call_titan_model(model_id, messages, max_tokens, temperature):
     )
     
     response_body = json.loads(response['body'].read())
-    
+
     # Titan returns token counts differently
     result = response_body['results'][0]
-    
+    output_text = result['outputText']
+
+    # Estimate tokens if not provided (cache word counts to avoid redundant splits)
+    token_count = result.get('tokenCount')
+    if token_count is not None:
+        input_tokens = token_count
+        output_tokens = token_count
+    else:
+        # Rough estimation: ~1.3 tokens per word on average
+        input_tokens = int(len(prompt.split()) * 1.3)
+        output_tokens = int(len(output_text.split()) * 1.3)
+
     return {
-        'content': result['outputText'],
-        'input_tokens': result.get('tokenCount', len(prompt.split()) * 2),  # Estimate if not provided
-        'output_tokens': result.get('tokenCount', len(result['outputText'].split()) * 2)
+        'content': output_text,
+        'input_tokens': input_tokens,
+        'output_tokens': output_tokens
     }
 
 
@@ -366,28 +405,31 @@ def validate_api_key(api_key):
     try:
         table = dynamodb.Table(API_KEYS_TABLE)
         response = table.get_item(Key={'api_key': api_key})
-        
+
         item = response.get('Item')
         if not item:
             return None
-        
+
         # Check if key is active
         if not item.get('is_active', True):
             return None
-        
+
         # Check expiration
         expires_at = item.get('expires_at')
         if expires_at and datetime.fromisoformat(expires_at) < datetime.now(timezone.utc):
             return None
-        
+
         return {
             'team_id': item['team_id'],
             'team_name': item.get('team_name', 'Unknown'),
             'rate_limit_rpm': int(item.get('rate_limit_rpm', RATE_LIMIT_RPM))
         }
-        
-    except Exception as e:
-        print(f"Error validating API key: {str(e)}")
+
+    except ClientError as e:
+        logger.error(f"DynamoDB error validating API key: {e.response['Error']['Code']}")
+        return None
+    except (KeyError, ValueError) as e:
+        logger.error(f"Invalid API key data format: {str(e)}")
         return None
 
 
@@ -397,7 +439,7 @@ def check_rate_limit(team_id, limit_rpm):
         table = dynamodb.Table(RATE_LIMITS_TABLE)
         now = int(time.time())
         minute_key = f"{team_id}:{now // 60}"
-        
+
         # Try to increment counter
         response = table.update_item(
             Key={'key': minute_key},
@@ -409,13 +451,16 @@ def check_rate_limit(team_id, limit_rpm):
             },
             ReturnValues='UPDATED_NEW'
         )
-        
+
         count = int(response['Attributes']['request_count'])
         return count <= limit_rpm
-        
-    except Exception as e:
-        print(f"Error checking rate limit: {str(e)}")
+
+    except ClientError as e:
+        logger.warning(f"DynamoDB error in rate limiting: {e.response['Error']['Code']} - failing open")
         return True  # Allow on error (fail open for availability)
+    except (KeyError, ValueError) as e:
+        logger.warning(f"Unexpected rate limit response format: {str(e)} - failing open")
+        return True
 
 
 def track_usage(team_id, model, input_tokens, output_tokens, cost):
@@ -423,7 +468,7 @@ def track_usage(team_id, model, input_tokens, output_tokens, cost):
     try:
         table = dynamodb.Table(USAGE_TABLE)
         today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
-        
+
         table.update_item(
             Key={
                 'team_id': team_id,
@@ -452,8 +497,8 @@ def track_usage(team_id, model, input_tokens, output_tokens, cost):
                 ':exp': int(time.time()) + (90 * 24 * 60 * 60)  # 90 days retention
             }
         )
-    except Exception as e:
-        print(f"Error tracking usage: {str(e)}")
+    except ClientError as e:
+        logger.warning(f"DynamoDB error tracking usage: {e.response['Error']['Code']}")
         # Don't fail the request if usage tracking fails
 
 

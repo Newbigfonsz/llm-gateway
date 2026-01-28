@@ -1,9 +1,10 @@
 import os
 import boto3
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import logging
+from botocore.exceptions import ClientError
 
-logger = logging.getLogger()
+logger = logging.getLogger(__name__)
 dynamodb = boto3.resource("dynamodb")
 api_keys_table = dynamodb.Table(os.environ.get("API_KEYS_TABLE", "llm-gateway-api-keys-dev"))
 rate_limits_table = dynamodb.Table(os.environ.get("RATE_LIMITS_TABLE", "llm-gateway-rate-limits-dev"))
@@ -20,7 +21,7 @@ def validate_api_key(api_key):
             return {"valid": False, "error": "API key disabled"}
         
         expires_at = item.get("expires_at")
-        if expires_at and datetime.fromisoformat(expires_at) < datetime.utcnow():
+        if expires_at and datetime.fromisoformat(expires_at) < datetime.now(timezone.utc):
             return {"valid": False, "error": "API key expired"}
         
         rate_limit = item.get("rate_limit_per_min", RATE_LIMIT_PER_MIN)
@@ -33,12 +34,15 @@ def validate_api_key(api_key):
             "rate_limited": rate_limited,
             "retry_after": retry_after
         }
-    except Exception as e:
-        logger.error(f"Auth error: {str(e)}")
+    except ClientError as e:
+        logger.error(f"DynamoDB error validating API key: {e.response['Error']['Code']}")
+        return {"valid": False, "error": "Authentication error"}
+    except (KeyError, ValueError) as e:
+        logger.error(f"Invalid API key data format: {str(e)}")
         return {"valid": False, "error": "Authentication error"}
 
 def check_rate_limit(api_key, limit):
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     window = now.strftime("%Y-%m-%dT%H:%M")
     try:
         response = rate_limits_table.update_item(
@@ -54,6 +58,9 @@ def check_rate_limit(api_key, limit):
         if count > limit:
             return True, 60 - now.second
         return False, 0
-    except Exception as e:
-        logger.error(f"Rate limit error: {str(e)}")
+    except ClientError as e:
+        logger.warning(f"DynamoDB error in rate limiting: {e.response['Error']['Code']} - failing open")
+        return False, 0
+    except (KeyError, ValueError) as e:
+        logger.warning(f"Unexpected rate limit response: {str(e)} - failing open")
         return False, 0
