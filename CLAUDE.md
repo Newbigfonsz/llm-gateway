@@ -106,8 +106,32 @@ Each model type requires different request formatting in the `invoke_bedrock_mod
 |----------|------|---------|
 | GET /health | None | Health check |
 | GET /v1/models | x-api-key | List models with pricing |
-| POST /v1/chat | x-api-key | OpenAI-compatible chat completion |
+| POST /v1/chat | x-api-key | OpenAI-compatible chat completion (supports streaming) |
 | GET /v1/usage | x-api-key | Usage stats for team (query: ?days=30) |
+
+## Streaming
+
+Add `"stream": true` to POST /v1/chat requests to receive Server-Sent Events:
+
+```json
+{"model": "claude-3-haiku", "messages": [{"role": "user", "content": "Hello"}], "stream": true}
+```
+
+Response is `Content-Type: text/event-stream` with SSE format:
+```
+data: {"id":"chatcmpl-...","object":"chat.completion.chunk","choices":[{"delta":{"content":"Hello"}}]}
+
+data: {"id":"chatcmpl-...","object":"chat.completion.chunk","choices":[{"delta":{},"finish_reason":"stop"}]}
+
+data: [DONE]
+```
+
+**Streaming support by model:**
+- Anthropic (claude-3-*): Supported via `invoke_model_with_response_stream`
+- Nova (nova-micro, nova-lite): Supported via `invoke_model_with_response_stream`
+- Titan: Not supported (returns 400 error)
+
+**Implementation:** `stream_anthropic_model()` and `stream_nova_model()` in `lambda/gateway/handler.py`
 
 ## Rules
 
