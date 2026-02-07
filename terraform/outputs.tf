@@ -36,6 +36,11 @@ output "dashboard_url" {
   value       = "https://${data.aws_region.current.name}.console.aws.amazon.com/cloudwatch/home?region=${data.aws_region.current.name}#dashboards:name=${aws_cloudwatch_dashboard.main.dashboard_name}"
 }
 
+output "request_logs_bucket" {
+  description = "S3 bucket for request logs (if enabled)"
+  value       = var.enable_request_logging ? aws_s3_bucket.request_logs[0].id : null
+}
+
 # Helpful commands output
 output "quick_start" {
   description = "Quick start commands"

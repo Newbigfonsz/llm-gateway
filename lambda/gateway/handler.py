@@ -19,6 +19,7 @@ logger.setLevel(logging.INFO)
 # Initialize clients (reused across Lambda invocations)
 dynamodb = boto3.resource('dynamodb')
 bedrock = boto3.client('bedrock-runtime')
+s3 = boto3.client('s3')
 
 # Environment variables
 API_KEYS_TABLE = os.environ.get('API_KEYS_TABLE')
@@ -26,6 +27,10 @@ USAGE_TABLE = os.environ.get('USAGE_TABLE')
 RATE_LIMITS_TABLE = os.environ.get('RATE_LIMITS_TABLE')
 DEFAULT_MODEL = os.environ.get('DEFAULT_MODEL', 'anthropic.claude-3-haiku-20240307-v1:0')
 RATE_LIMIT_RPM = int(os.environ.get('RATE_LIMIT_RPM', 60))
+
+# S3 Request Logging
+ENABLE_REQUEST_LOGGING = os.environ.get('ENABLE_REQUEST_LOGGING', 'false').lower() == 'true'
+REQUEST_LOGS_BUCKET = os.environ.get('REQUEST_LOGS_BUCKET')
 
 # Model mapping (friendly name -> Bedrock model ID)
 MODEL_MAPPING = {
@@ -209,9 +214,10 @@ def chat_completion(body, team_info):
         pricing = MODEL_PRICING.get(model_id, {'input': 0, 'output': 0})
         cost = (input_tokens / 1000 * pricing['input']) + (output_tokens / 1000 * pricing['output'])
         
-        # Track usage
+        # Track usage and log to S3
         track_usage(team_info['team_id'], model_name, input_tokens, output_tokens, cost)
-        
+        log_request_to_s3(team_info['team_id'], model_name, input_tokens, output_tokens, latency_ms, cost)
+
         # Return response in OpenAI-compatible format
         return {
             'statusCode': 200,
@@ -324,10 +330,11 @@ def chat_completion_stream(model_id, model_name, messages, max_tokens, temperatu
 
         latency_ms = int((time.time() - start_time) * 1000)
 
-        # Calculate cost and track usage
+        # Calculate cost, track usage, and log to S3
         pricing = MODEL_PRICING.get(model_id, {'input': 0, 'output': 0})
         cost = (input_tokens / 1000 * pricing['input']) + (output_tokens / 1000 * pricing['output'])
         track_usage(team_info['team_id'], model_name, input_tokens, output_tokens, cost)
+        log_request_to_s3(team_info['team_id'], model_name, input_tokens, output_tokens, latency_ms, cost, stream=True)
 
         logger.info(f"Streaming complete: {output_tokens} tokens, {latency_ms}ms")
 
@@ -734,6 +741,45 @@ def track_usage(team_id, model, input_tokens, output_tokens, cost):
     except ClientError as e:
         logger.warning(f"DynamoDB error tracking usage: {e.response['Error']['Code']}")
         # Don't fail the request if usage tracking fails
+
+
+def log_request_to_s3(team_id, model, input_tokens, output_tokens, latency_ms, cost, stream=False):
+    """Log request metadata to S3 for analytics. Does not log prompt/response content."""
+    if not ENABLE_REQUEST_LOGGING or not REQUEST_LOGS_BUCKET:
+        return
+
+    try:
+        now = datetime.now(timezone.utc)
+        request_id = context_id()
+
+        log_entry = {
+            'request_id': request_id,
+            'timestamp': now.isoformat(),
+            'team_id': team_id,
+            'model': model,
+            'input_tokens': input_tokens,
+            'output_tokens': output_tokens,
+            'total_tokens': input_tokens + output_tokens,
+            'latency_ms': latency_ms,
+            'cost_usd': round(cost, 6),
+            'stream': stream
+        }
+
+        # Organize logs by date: logs/YYYY/MM/DD/HH/request_id.json
+        key = f"logs/{now.strftime('%Y/%m/%d/%H')}/{request_id}.json"
+
+        s3.put_object(
+            Bucket=REQUEST_LOGS_BUCKET,
+            Key=key,
+            Body=json.dumps(log_entry),
+            ContentType='application/json'
+        )
+
+        logger.debug(f"Logged request {request_id} to S3")
+
+    except ClientError as e:
+        logger.warning(f"S3 error logging request: {e.response['Error']['Code']}")
+        # Don't fail the request if logging fails
 
 
 def context_id():

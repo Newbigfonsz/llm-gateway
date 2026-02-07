@@ -81,3 +81,19 @@ variable "model_pricing" {
     }
   }
 }
+
+# -----------------------------------------------------------------------------
+# REQUEST LOGGING
+# -----------------------------------------------------------------------------
+
+variable "enable_request_logging" {
+  description = "Enable request logging to S3 (logs model, tokens, latency, team_id - no prompt/response content)"
+  type        = bool
+  default     = false
+}
+
+variable "request_log_retention_days" {
+  description = "Number of days to retain request logs in S3"
+  type        = number
+  default     = 90
+}
