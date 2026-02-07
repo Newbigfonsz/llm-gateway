@@ -31,6 +31,11 @@ output "region" {
   value       = data.aws_region.current.name
 }
 
+output "dashboard_url" {
+  description = "CloudWatch Dashboard URL"
+  value       = "https://${data.aws_region.current.name}.console.aws.amazon.com/cloudwatch/home?region=${data.aws_region.current.name}#dashboards:name=${aws_cloudwatch_dashboard.main.dashboard_name}"
+}
+
 # Helpful commands output
 output "quick_start" {
   description = "Quick start commands"
