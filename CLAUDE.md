@@ -133,6 +133,21 @@ data: [DONE]
 
 **Implementation:** `stream_anthropic_model()` and `stream_nova_model()` in `lambda/gateway/handler.py`
 
+## Observability
+
+CloudWatch dashboard (`terraform/dashboard.tf`) provides real-time monitoring:
+
+| Section | Widgets |
+|---------|---------|
+| API Gateway | Request Count, Latency (p50/p99), Error Rates (4xx/5xx) |
+| Lambda | Concurrent Executions, Errors, Duration (p50/p99) |
+| DynamoDB | Consumed Read/Write Capacity, Throttled Requests |
+
+Access the dashboard after deployment:
+```bash
+terraform output dashboard_url
+```
+
 ## Rules
 
 - Never run `terraform apply` without a plan file; always use `terraform plan -out=tfplan` then `terraform apply tfplan`
