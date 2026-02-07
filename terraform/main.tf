@@ -237,16 +237,22 @@ resource "aws_lambda_function" "gateway" {
   memory_size      = 256
   
   environment {
-    variables = {
-      ENVIRONMENT       = var.environment
-      API_KEYS_TABLE    = aws_dynamodb_table.api_keys.name
-      USAGE_TABLE       = aws_dynamodb_table.usage.name
-      RATE_LIMITS_TABLE = aws_dynamodb_table.rate_limits.name
-      DEFAULT_MODEL     = var.default_model
-      RATE_LIMIT_RPM    = var.rate_limit_rpm
-    }
+    variables = merge(
+      {
+        ENVIRONMENT       = var.environment
+        API_KEYS_TABLE    = aws_dynamodb_table.api_keys.name
+        USAGE_TABLE       = aws_dynamodb_table.usage.name
+        RATE_LIMITS_TABLE = aws_dynamodb_table.rate_limits.name
+        DEFAULT_MODEL     = var.default_model
+        RATE_LIMIT_RPM    = var.rate_limit_rpm
+      },
+      var.enable_request_logging ? {
+        ENABLE_REQUEST_LOGGING = "true"
+        REQUEST_LOGS_BUCKET    = aws_s3_bucket.request_logs[0].id
+      } : {}
+    )
   }
-  
+
   tags = {
     Name = "${var.project_name}-gateway"
   }

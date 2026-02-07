@@ -618,3 +618,225 @@ class TestStagePrefix:
         response = gateway.lambda_handler(event, None)
 
         assert response['statusCode'] == 200
+
+
+class TestS3RequestLogging:
+    """Tests for S3 request logging."""
+
+    @mock_aws
+    def test_logging_disabled_by_default(self, dynamodb_tables, valid_api_key):
+        """S3 logging should be disabled by default."""
+        gateway = load_handler_module("gateway")
+
+        # Mock Bedrock response
+        mock_response = {
+            'body': MagicMock()
+        }
+        mock_response['body'].read.return_value = json.dumps({
+            'content': [{'text': 'Hello!'}],
+            'usage': {'input_tokens': 10, 'output_tokens': 5}
+        }).encode()
+
+        with patch.object(gateway, 'bedrock') as mock_bedrock, \
+             patch.object(gateway, 's3') as mock_s3:
+            mock_bedrock.invoke_model.return_value = mock_response
+
+            event = make_api_gateway_event(
+                '/v1/chat', 'POST',
+                headers={'x-api-key': valid_api_key},
+                body={'model': 'claude-3-haiku', 'messages': [{'role': 'user', 'content': 'Hi'}]}
+            )
+            response = gateway.lambda_handler(event, None)
+
+        assert response['statusCode'] == 200
+        # S3 put_object should NOT be called when logging is disabled
+        mock_s3.put_object.assert_not_called()
+
+    @mock_aws
+    def test_logging_enabled_logs_to_s3(self, dynamodb_tables, valid_api_key):
+        """When enabled, requests should be logged to S3."""
+        gateway = load_handler_module("gateway")
+
+        # Enable logging
+        original_enable = gateway.ENABLE_REQUEST_LOGGING
+        original_bucket = gateway.REQUEST_LOGS_BUCKET
+        gateway.ENABLE_REQUEST_LOGGING = True
+        gateway.REQUEST_LOGS_BUCKET = 'test-logs-bucket'
+
+        try:
+            mock_response = {
+                'body': MagicMock()
+            }
+            mock_response['body'].read.return_value = json.dumps({
+                'content': [{'text': 'Hello!'}],
+                'usage': {'input_tokens': 10, 'output_tokens': 5}
+            }).encode()
+
+            with patch.object(gateway, 'bedrock') as mock_bedrock, \
+                 patch.object(gateway, 's3') as mock_s3:
+                mock_bedrock.invoke_model.return_value = mock_response
+
+                event = make_api_gateway_event(
+                    '/v1/chat', 'POST',
+                    headers={'x-api-key': valid_api_key},
+                    body={'model': 'claude-3-haiku', 'messages': [{'role': 'user', 'content': 'Hi'}]}
+                )
+                response = gateway.lambda_handler(event, None)
+
+            assert response['statusCode'] == 200
+            # S3 put_object should be called
+            mock_s3.put_object.assert_called_once()
+
+            # Verify log content
+            call_kwargs = mock_s3.put_object.call_args[1]
+            assert call_kwargs['Bucket'] == 'test-logs-bucket'
+            assert call_kwargs['Key'].startswith('logs/')
+            assert call_kwargs['ContentType'] == 'application/json'
+
+            log_entry = json.loads(call_kwargs['Body'])
+            assert log_entry['team_id'] == 'test-team'
+            assert log_entry['model'] == 'claude-3-haiku'
+            assert log_entry['input_tokens'] == 10
+            assert log_entry['output_tokens'] == 5
+            assert 'timestamp' in log_entry
+            assert 'latency_ms' in log_entry
+            assert 'cost_usd' in log_entry
+            assert log_entry['stream'] is False
+
+        finally:
+            gateway.ENABLE_REQUEST_LOGGING = original_enable
+            gateway.REQUEST_LOGS_BUCKET = original_bucket
+
+    @mock_aws
+    def test_logging_does_not_include_prompt_content(self, dynamodb_tables, valid_api_key):
+        """Logs should NOT contain prompt or response content."""
+        gateway = load_handler_module("gateway")
+
+        original_enable = gateway.ENABLE_REQUEST_LOGGING
+        original_bucket = gateway.REQUEST_LOGS_BUCKET
+        gateway.ENABLE_REQUEST_LOGGING = True
+        gateway.REQUEST_LOGS_BUCKET = 'test-logs-bucket'
+
+        try:
+            mock_response = {
+                'body': MagicMock()
+            }
+            mock_response['body'].read.return_value = json.dumps({
+                'content': [{'text': 'This is a secret response!'}],
+                'usage': {'input_tokens': 10, 'output_tokens': 5}
+            }).encode()
+
+            with patch.object(gateway, 'bedrock') as mock_bedrock, \
+                 patch.object(gateway, 's3') as mock_s3:
+                mock_bedrock.invoke_model.return_value = mock_response
+
+                event = make_api_gateway_event(
+                    '/v1/chat', 'POST',
+                    headers={'x-api-key': valid_api_key},
+                    body={'model': 'claude-3-haiku', 'messages': [{'role': 'user', 'content': 'Secret prompt!'}]}
+                )
+                gateway.lambda_handler(event, None)
+
+            # Verify log does NOT contain prompt or response content
+            call_kwargs = mock_s3.put_object.call_args[1]
+            log_entry = json.loads(call_kwargs['Body'])
+
+            assert 'Secret prompt' not in json.dumps(log_entry)
+            assert 'secret response' not in json.dumps(log_entry)
+            assert 'content' not in log_entry
+            assert 'messages' not in log_entry
+            assert 'prompt' not in log_entry
+
+        finally:
+            gateway.ENABLE_REQUEST_LOGGING = original_enable
+            gateway.REQUEST_LOGS_BUCKET = original_bucket
+
+    @mock_aws
+    def test_streaming_request_logged_with_stream_flag(self, dynamodb_tables, valid_api_key):
+        """Streaming requests should be logged with stream=True."""
+        gateway = load_handler_module("gateway")
+
+        original_enable = gateway.ENABLE_REQUEST_LOGGING
+        original_bucket = gateway.REQUEST_LOGS_BUCKET
+        gateway.ENABLE_REQUEST_LOGGING = True
+        gateway.REQUEST_LOGS_BUCKET = 'test-logs-bucket'
+
+        try:
+            # Mock streaming response
+            mock_stream = [
+                {'chunk': {'bytes': json.dumps({'type': 'message_start', 'message': {'usage': {'input_tokens': 10}}}).encode()}},
+                {'chunk': {'bytes': json.dumps({'type': 'content_block_delta', 'delta': {'type': 'text_delta', 'text': 'Hi'}}).encode()}},
+                {'chunk': {'bytes': json.dumps({'type': 'message_delta', 'usage': {'output_tokens': 5}}).encode()}},
+                {'chunk': {'bytes': json.dumps({'type': 'message_stop'}).encode()}},
+            ]
+
+            with patch.object(gateway, 'bedrock') as mock_bedrock, \
+                 patch.object(gateway, 's3') as mock_s3:
+                mock_bedrock.invoke_model_with_response_stream.return_value = {'body': mock_stream}
+
+                event = make_api_gateway_event(
+                    '/v1/chat', 'POST',
+                    headers={'x-api-key': valid_api_key},
+                    body={
+                        'model': 'claude-3-haiku',
+                        'messages': [{'role': 'user', 'content': 'Hi'}],
+                        'stream': True
+                    }
+                )
+                response = gateway.lambda_handler(event, None)
+
+            assert response['statusCode'] == 200
+            mock_s3.put_object.assert_called_once()
+
+            call_kwargs = mock_s3.put_object.call_args[1]
+            log_entry = json.loads(call_kwargs['Body'])
+            assert log_entry['stream'] is True
+
+        finally:
+            gateway.ENABLE_REQUEST_LOGGING = original_enable
+            gateway.REQUEST_LOGS_BUCKET = original_bucket
+
+    @mock_aws
+    def test_s3_error_does_not_fail_request(self, dynamodb_tables, valid_api_key):
+        """S3 logging errors should not fail the main request."""
+        gateway = load_handler_module("gateway")
+
+        original_enable = gateway.ENABLE_REQUEST_LOGGING
+        original_bucket = gateway.REQUEST_LOGS_BUCKET
+        gateway.ENABLE_REQUEST_LOGGING = True
+        gateway.REQUEST_LOGS_BUCKET = 'test-logs-bucket'
+
+        try:
+            mock_response = {
+                'body': MagicMock()
+            }
+            mock_response['body'].read.return_value = json.dumps({
+                'content': [{'text': 'Hello!'}],
+                'usage': {'input_tokens': 10, 'output_tokens': 5}
+            }).encode()
+
+            from botocore.exceptions import ClientError
+
+            with patch.object(gateway, 'bedrock') as mock_bedrock, \
+                 patch.object(gateway, 's3') as mock_s3:
+                mock_bedrock.invoke_model.return_value = mock_response
+                mock_s3.put_object.side_effect = ClientError(
+                    {'Error': {'Code': 'AccessDenied', 'Message': 'Access Denied'}},
+                    'PutObject'
+                )
+
+                event = make_api_gateway_event(
+                    '/v1/chat', 'POST',
+                    headers={'x-api-key': valid_api_key},
+                    body={'model': 'claude-3-haiku', 'messages': [{'role': 'user', 'content': 'Hi'}]}
+                )
+                response = gateway.lambda_handler(event, None)
+
+            # Request should still succeed even if S3 logging fails
+            assert response['statusCode'] == 200
+            body = json.loads(response['body'])
+            assert body['choices'][0]['message']['content'] == 'Hello!'
+
+        finally:
+            gateway.ENABLE_REQUEST_LOGGING = original_enable
+            gateway.REQUEST_LOGS_BUCKET = original_bucket
