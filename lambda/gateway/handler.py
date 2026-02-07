@@ -159,6 +159,7 @@ def chat_completion(body, team_info):
     messages = body.get('messages', [])
     max_tokens = body.get('max_tokens', 1024)
     temperature = body.get('temperature', 0.7)
+    stream = body.get('stream', False)
 
     # Validate messages
     if not messages:
@@ -186,7 +187,11 @@ def chat_completion(body, team_info):
     try:
         # Call Bedrock
         start_time = time.time()
-        
+
+        # Handle streaming requests
+        if stream:
+            return chat_completion_stream(model_id, model_name, messages, max_tokens, temperature, team_info)
+
         if model_id.startswith('anthropic.'):
             response = call_anthropic_model(model_id, messages, max_tokens, temperature)
         elif model_id.startswith('amazon.nova'):
@@ -248,6 +253,235 @@ def chat_completion(body, team_info):
     except json.JSONDecodeError as e:
         logger.error(f"Failed to decode Bedrock response: {str(e)}")
         return error_response(500, 'Invalid response from model')
+
+
+def chat_completion_stream(model_id, model_name, messages, max_tokens, temperature, team_info):
+    """Handle streaming chat completion requests via Bedrock."""
+
+    start_time = time.time()
+    completion_id = f"chatcmpl-{context_id()}"
+    created = int(time.time())
+
+    # Build SSE events
+    sse_events = []
+    full_content = ""
+    input_tokens = 0
+    output_tokens = 0
+
+    try:
+        if model_id.startswith('anthropic.'):
+            chunks = stream_anthropic_model(model_id, messages, max_tokens, temperature)
+        elif model_id.startswith('amazon.nova'):
+            chunks = stream_nova_model(model_id, messages, max_tokens, temperature)
+        elif model_id.startswith('amazon.'):
+            # Titan doesn't support streaming well, fall back to non-streaming
+            return error_response(400, f'Streaming not supported for model: {model_name}')
+        else:
+            return error_response(400, f'Unsupported model provider for: {model_id}')
+
+        for chunk in chunks:
+            if chunk.get('type') == 'content_delta':
+                delta_text = chunk.get('text', '')
+                full_content += delta_text
+
+                # Create SSE event for content delta
+                event_data = {
+                    'id': completion_id,
+                    'object': 'chat.completion.chunk',
+                    'created': created,
+                    'model': model_name,
+                    'choices': [{
+                        'index': 0,
+                        'delta': {'content': delta_text},
+                        'finish_reason': None
+                    }]
+                }
+                sse_events.append(f"data: {json.dumps(event_data)}\n\n")
+
+            elif chunk.get('type') == 'message_start':
+                input_tokens = chunk.get('input_tokens', 0)
+
+            elif chunk.get('type') == 'message_delta':
+                output_tokens = chunk.get('output_tokens', 0)
+
+            elif chunk.get('type') == 'message_stop':
+                # Final event with finish_reason
+                event_data = {
+                    'id': completion_id,
+                    'object': 'chat.completion.chunk',
+                    'created': created,
+                    'model': model_name,
+                    'choices': [{
+                        'index': 0,
+                        'delta': {},
+                        'finish_reason': 'stop'
+                    }]
+                }
+                sse_events.append(f"data: {json.dumps(event_data)}\n\n")
+
+        # Add [DONE] marker
+        sse_events.append("data: [DONE]\n\n")
+
+        latency_ms = int((time.time() - start_time) * 1000)
+
+        # Calculate cost and track usage
+        pricing = MODEL_PRICING.get(model_id, {'input': 0, 'output': 0})
+        cost = (input_tokens / 1000 * pricing['input']) + (output_tokens / 1000 * pricing['output'])
+        track_usage(team_info['team_id'], model_name, input_tokens, output_tokens, cost)
+
+        logger.info(f"Streaming complete: {output_tokens} tokens, {latency_ms}ms")
+
+        return {
+            'statusCode': 200,
+            'headers': {
+                'Content-Type': 'text/event-stream',
+                'Cache-Control': 'no-cache',
+                'Connection': 'keep-alive'
+            },
+            'body': ''.join(sse_events)
+        }
+
+    except ClientError as e:
+        error_code = e.response.get('Error', {}).get('Code', 'Unknown')
+        logger.error(f"Bedrock streaming error: {error_code} - {str(e)}")
+        return error_response(500, f'Streaming invocation failed: {error_code}')
+
+
+def stream_anthropic_model(model_id, messages, max_tokens, temperature):
+    """Stream from Anthropic model via Bedrock."""
+
+    # Format messages for Anthropic
+    formatted_messages = []
+    system_prompt = None
+
+    for msg in messages:
+        role = msg.get('role', 'user')
+        content = msg.get('content', '')
+
+        if role == 'system':
+            system_prompt = content
+        else:
+            formatted_messages.append({
+                'role': role,
+                'content': content
+            })
+
+    # Build request body
+    request_body = {
+        'anthropic_version': 'bedrock-2023-05-31',
+        'max_tokens': max_tokens,
+        'temperature': temperature,
+        'messages': formatted_messages
+    }
+
+    if system_prompt:
+        request_body['system'] = system_prompt
+
+    # Call Bedrock with streaming
+    response = bedrock.invoke_model_with_response_stream(
+        modelId=model_id,
+        contentType='application/json',
+        accept='application/json',
+        body=json.dumps(request_body)
+    )
+
+    # Process stream events
+    for event in response['body']:
+        if 'chunk' in event:
+            chunk_data = json.loads(event['chunk']['bytes'].decode())
+            event_type = chunk_data.get('type', '')
+
+            if event_type == 'message_start':
+                usage = chunk_data.get('message', {}).get('usage', {})
+                yield {
+                    'type': 'message_start',
+                    'input_tokens': usage.get('input_tokens', 0)
+                }
+
+            elif event_type == 'content_block_delta':
+                delta = chunk_data.get('delta', {})
+                if delta.get('type') == 'text_delta':
+                    yield {
+                        'type': 'content_delta',
+                        'text': delta.get('text', '')
+                    }
+
+            elif event_type == 'message_delta':
+                usage = chunk_data.get('usage', {})
+                yield {
+                    'type': 'message_delta',
+                    'output_tokens': usage.get('output_tokens', 0)
+                }
+
+            elif event_type == 'message_stop':
+                yield {'type': 'message_stop'}
+
+
+def stream_nova_model(model_id, messages, max_tokens, temperature):
+    """Stream from Amazon Nova model via Bedrock."""
+
+    # Format messages for Nova
+    formatted_messages = []
+    system_prompt = None
+
+    for msg in messages:
+        role = msg.get('role', 'user')
+        content = msg.get('content', '')
+
+        if role == 'system':
+            system_prompt = content
+        else:
+            formatted_messages.append({
+                'role': role,
+                'content': [{'text': content}]
+            })
+
+    request_body = {
+        'messages': formatted_messages,
+        'inferenceConfig': {
+            'maxTokens': max_tokens,
+            'temperature': temperature
+        }
+    }
+
+    if system_prompt:
+        request_body['system'] = [{'text': system_prompt}]
+
+    # Call Bedrock with streaming
+    response = bedrock.invoke_model_with_response_stream(
+        modelId=model_id,
+        contentType='application/json',
+        accept='application/json',
+        body=json.dumps(request_body)
+    )
+
+    # Process stream events
+    for event in response['body']:
+        if 'chunk' in event:
+            chunk_data = json.loads(event['chunk']['bytes'].decode())
+
+            # Nova streaming format
+            if 'contentBlockDelta' in chunk_data:
+                delta = chunk_data['contentBlockDelta'].get('delta', {})
+                if 'text' in delta:
+                    yield {
+                        'type': 'content_delta',
+                        'text': delta['text']
+                    }
+
+            elif 'messageStart' in chunk_data:
+                yield {'type': 'message_start', 'input_tokens': 0}
+
+            elif 'messageStop' in chunk_data:
+                yield {'type': 'message_stop'}
+
+            elif 'metadata' in chunk_data:
+                usage = chunk_data['metadata'].get('usage', {})
+                yield {
+                    'type': 'message_delta',
+                    'input_tokens': usage.get('inputTokens', 0),
+                    'output_tokens': usage.get('outputTokens', 0)
+                }
 
 
 def call_anthropic_model(model_id, messages, max_tokens, temperature):

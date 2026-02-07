@@ -354,6 +354,185 @@ class TestChatCompletion:
             assert request_body['system'] == 'You are a helpful assistant.'
 
 
+class TestStreamingChat:
+    """Tests for streaming chat completion."""
+
+    @mock_aws
+    def test_streaming_anthropic_model_success(self, dynamodb_tables, valid_api_key):
+        """Streaming chat with Anthropic model should return SSE events."""
+        gateway = load_handler_module("gateway")
+
+        # Mock streaming response chunks
+        def make_chunk(data):
+            return {'chunk': {'bytes': json.dumps(data).encode()}}
+
+        mock_stream = [
+            make_chunk({'type': 'message_start', 'message': {'usage': {'input_tokens': 10}}}),
+            make_chunk({'type': 'content_block_delta', 'delta': {'type': 'text_delta', 'text': 'Hello'}}),
+            make_chunk({'type': 'content_block_delta', 'delta': {'type': 'text_delta', 'text': ' world!'}}),
+            make_chunk({'type': 'message_delta', 'usage': {'output_tokens': 5}}),
+            make_chunk({'type': 'message_stop'}),
+        ]
+
+        with patch.object(gateway, 'bedrock') as mock_bedrock:
+            mock_bedrock.invoke_model_with_response_stream.return_value = {'body': mock_stream}
+
+            event = make_api_gateway_event(
+                '/v1/chat', 'POST',
+                headers={'x-api-key': valid_api_key},
+                body={
+                    'model': 'claude-3-haiku',
+                    'messages': [{'role': 'user', 'content': 'Hello'}],
+                    'stream': True
+                }
+            )
+            response = gateway.lambda_handler(event, None)
+
+        assert response['statusCode'] == 200
+        assert response['headers']['Content-Type'] == 'text/event-stream'
+
+        # Parse SSE events
+        body = response['body']
+        assert 'data: ' in body
+        assert 'data: [DONE]' in body
+
+        # Check content was streamed
+        events = [line for line in body.split('\n\n') if line.startswith('data: ') and line != 'data: [DONE]']
+        assert len(events) >= 2  # At least content chunks + finish
+
+        # Verify first content chunk
+        first_event = json.loads(events[0].replace('data: ', ''))
+        assert first_event['object'] == 'chat.completion.chunk'
+        assert first_event['model'] == 'claude-3-haiku'
+        assert 'delta' in first_event['choices'][0]
+
+    @mock_aws
+    def test_streaming_nova_model_success(self, dynamodb_tables, valid_api_key):
+        """Streaming chat with Nova model should return SSE events."""
+        gateway = load_handler_module("gateway")
+
+        # Mock Nova streaming response chunks
+        def make_chunk(data):
+            return {'chunk': {'bytes': json.dumps(data).encode()}}
+
+        mock_stream = [
+            make_chunk({'messageStart': {'role': 'assistant'}}),
+            make_chunk({'contentBlockDelta': {'delta': {'text': 'Nova '}}}),
+            make_chunk({'contentBlockDelta': {'delta': {'text': 'response'}}}),
+            make_chunk({'messageStop': {'stopReason': 'end_turn'}}),
+            make_chunk({'metadata': {'usage': {'inputTokens': 8, 'outputTokens': 4}}}),
+        ]
+
+        with patch.object(gateway, 'bedrock') as mock_bedrock:
+            mock_bedrock.invoke_model_with_response_stream.return_value = {'body': mock_stream}
+
+            event = make_api_gateway_event(
+                '/v1/chat', 'POST',
+                headers={'x-api-key': valid_api_key},
+                body={
+                    'model': 'nova-micro',
+                    'messages': [{'role': 'user', 'content': 'Hello'}],
+                    'stream': True
+                }
+            )
+            response = gateway.lambda_handler(event, None)
+
+        assert response['statusCode'] == 200
+        assert response['headers']['Content-Type'] == 'text/event-stream'
+        assert 'data: [DONE]' in response['body']
+
+    @mock_aws
+    def test_streaming_titan_returns_error(self, dynamodb_tables, valid_api_key):
+        """Streaming with Titan model should return error (not supported)."""
+        gateway = load_handler_module("gateway")
+
+        event = make_api_gateway_event(
+            '/v1/chat', 'POST',
+            headers={'x-api-key': valid_api_key},
+            body={
+                'model': 'titan-text-express',
+                'messages': [{'role': 'user', 'content': 'Hello'}],
+                'stream': True
+            }
+        )
+        response = gateway.lambda_handler(event, None)
+
+        assert response['statusCode'] == 400
+        body = json.loads(response['body'])
+        assert 'Streaming not supported' in body['error']['message']
+
+    @mock_aws
+    def test_streaming_false_uses_normal_path(self, dynamodb_tables, valid_api_key):
+        """Setting stream=false should use normal non-streaming path."""
+        gateway = load_handler_module("gateway")
+
+        mock_response_body = {
+            'content': [{'text': 'Normal response'}],
+            'usage': {'input_tokens': 10, 'output_tokens': 5}
+        }
+        mock_body = MagicMock()
+        mock_body.read.return_value = json.dumps(mock_response_body).encode()
+
+        with patch.object(gateway, 'bedrock') as mock_bedrock:
+            mock_bedrock.invoke_model.return_value = {'body': mock_body}
+
+            event = make_api_gateway_event(
+                '/v1/chat', 'POST',
+                headers={'x-api-key': valid_api_key},
+                body={
+                    'model': 'claude-3-haiku',
+                    'messages': [{'role': 'user', 'content': 'Hello'}],
+                    'stream': False
+                }
+            )
+            response = gateway.lambda_handler(event, None)
+
+        assert response['statusCode'] == 200
+        assert response['headers']['Content-Type'] == 'application/json'
+        body = json.loads(response['body'])
+        assert body['object'] == 'chat.completion'  # Not chat.completion.chunk
+
+    @mock_aws
+    def test_streaming_sse_format_correct(self, dynamodb_tables, valid_api_key):
+        """SSE events should follow correct format."""
+        gateway = load_handler_module("gateway")
+
+        def make_chunk(data):
+            return {'chunk': {'bytes': json.dumps(data).encode()}}
+
+        mock_stream = [
+            make_chunk({'type': 'message_start', 'message': {'usage': {'input_tokens': 5}}}),
+            make_chunk({'type': 'content_block_delta', 'delta': {'type': 'text_delta', 'text': 'Test'}}),
+            make_chunk({'type': 'message_delta', 'usage': {'output_tokens': 2}}),
+            make_chunk({'type': 'message_stop'}),
+        ]
+
+        with patch.object(gateway, 'bedrock') as mock_bedrock:
+            mock_bedrock.invoke_model_with_response_stream.return_value = {'body': mock_stream}
+
+            event = make_api_gateway_event(
+                '/v1/chat', 'POST',
+                headers={'x-api-key': valid_api_key},
+                body={
+                    'model': 'claude-3-haiku',
+                    'messages': [{'role': 'user', 'content': 'Hi'}],
+                    'stream': True
+                }
+            )
+            response = gateway.lambda_handler(event, None)
+
+        body = response['body']
+
+        # Each SSE event should be "data: {...}\n\n"
+        lines = body.split('\n\n')
+        for line in lines:
+            if line:
+                assert line.startswith('data: '), f"SSE line should start with 'data: ': {line}"
+
+        # Last event should be [DONE]
+        assert lines[-2] == 'data: [DONE]'
+
+
 class TestRateLimiting:
     """Tests for rate limiting."""
 
