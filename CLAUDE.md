@@ -46,6 +46,13 @@ pytest tests/test_gateway.py::TestAuthentication::test_missing_api_key_returns_4
 ruff check lambda/ tests/
 ```
 
+**Pre-commit Hook**: Automatically runs `ruff check` and `pytest` before each commit. Located at `.git/hooks/pre-commit`.
+
+**CI Pipeline**: GitHub Actions runs on every PR (`.github/workflows/ci.yml`):
+- Terraform validate
+- Ruff lint
+- Pytest with coverage
+
 **Manual API Testing** (PowerShell):
 ```powershell
 $API = terraform output -raw api_endpoint

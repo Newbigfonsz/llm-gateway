@@ -36,6 +36,25 @@ variable "log_retention_days" {
   default     = 7
 }
 
+variable "cors_allowed_origins" {
+  description = "Allowed origins for CORS (e.g., https://example.com)"
+  type        = list(string)
+  default     = ["https://example.com"]
+}
+
+variable "bedrock_model_ids" {
+  description = "Bedrock model IDs to allow in IAM policy"
+  type        = list(string)
+  default = [
+    "anthropic.claude-3-haiku-20240307-v1:0",
+    "anthropic.claude-3-sonnet-20240229-v1:0",
+    "anthropic.claude-3-5-sonnet-20240620-v1:0",
+    "amazon.titan-text-express-v1",
+    "amazon.nova-micro-v1:0",
+    "amazon.nova-lite-v1:0"
+  ]
+}
+
 # Model pricing for cost tracking (per 1K tokens)
 variable "model_pricing" {
   description = "Model pricing per 1K tokens (input/output)"

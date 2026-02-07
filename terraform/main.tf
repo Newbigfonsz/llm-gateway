@@ -40,6 +40,18 @@ data "aws_caller_identity" "current" {}
 data "aws_region" "current" {}
 
 # -----------------------------------------------------------------------------
+# LOCALS
+# -----------------------------------------------------------------------------
+
+locals {
+  # Construct Bedrock model ARNs from model IDs
+  bedrock_model_arns = [
+    for model_id in var.bedrock_model_ids :
+    "arn:aws:bedrock:${data.aws_region.current.name}::foundation-model/${model_id}"
+  ]
+}
+
+# -----------------------------------------------------------------------------
 # DYNAMODB TABLES
 # -----------------------------------------------------------------------------
 
@@ -182,10 +194,9 @@ resource "aws_iam_role_policy" "lambda_policy" {
         Effect = "Allow"
         Action = [
           "bedrock:InvokeModel",
-          "bedrock:InvokeModelWithResponseStream",
-          "bedrock:ListFoundationModels"
+          "bedrock:InvokeModelWithResponseStream"
         ]
-        Resource = "*"
+        Resource = local.bedrock_model_arns
       }
     ]
   })
@@ -313,7 +324,7 @@ resource "aws_apigatewayv2_api" "main" {
   cors_configuration {
     allow_headers = ["Content-Type", "x-api-key", "Authorization"]
     allow_methods = ["GET", "POST", "OPTIONS"]
-    allow_origins = ["*"]
+    allow_origins = var.cors_allowed_origins
     max_age       = 300
   }
   
