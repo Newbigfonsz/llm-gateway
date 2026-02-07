@@ -7,3 +7,7 @@ project_name       = "llm-gateway"
 default_model      = "anthropic.claude-3-haiku-20240307-v1:0"
 rate_limit_rpm     = 60
 log_retention_days = 7
+
+# S3 Request Logging
+enable_request_logging     = true
+request_log_retention_days = 90
