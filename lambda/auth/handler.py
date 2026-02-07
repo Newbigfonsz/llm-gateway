@@ -9,7 +9,16 @@ import boto3
 import secrets
 import logging
 from datetime import datetime, timezone
+from decimal import Decimal
 from botocore.exceptions import ClientError
+
+
+class DecimalEncoder(json.JSONEncoder):
+    """Handle Decimal serialization for DynamoDB."""
+    def default(self, o):
+        if isinstance(o, Decimal):
+            return int(o) if o % 1 == 0 else float(o)
+        return super().default(o)
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -113,7 +122,7 @@ def list_api_keys():
             'body': json.dumps({
                 'keys': keys,
                 'count': len(keys)
-            })
+            }, cls=DecimalEncoder)
         }
         
     except ClientError as e:
